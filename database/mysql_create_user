@@ -1,0 +1,191 @@
+#!/bin/bash
+# Script to create mysql user, db, allow connections
+# Author - Amit Sharma <amitsharma928@gmail.com>
+
+set -e
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script must be run as root or with sudo" 1>&2
+    exit 1
+fi
+
+LOG_FILE="/root/mysql_user_create_script.log"
+CONFIG_FILE="/etc/mysql-create-user/mysql_create_user_server_config.conf"
+
+# Function to print help
+print_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "Script to create new db/user"
+    echo "Options:"
+    echo "  -h, --help             Display this help message"
+    echo "  -l, --list             List all databases and users in a table format"
+    echo "  -c  --create           Create new db/user"
+    echo "  -ap --add-permission   Add permissions to existing user"
+}
+
+# Function to list data from the log file
+list_data() {
+    # Check if the log file exists
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "Log file not found at ${LOG_FILE}!"
+        exit 1
+    fi
+
+    echo "Server name and associated IP:"
+    awk -F'|' '{print $1,$2}' /etc/mysql-backup/info | column -t
+    echo -e "\n"
+    # Print the data in table format using jq
+    jq -r ' . as $row | "\($row.date) | \($row.database_name) | \($row.mysql_user) | \($row.mysql_password) | \($row.allowed_ips | join(", "))"' "$LOG_FILE" | column -ts $'\t'
+}
+
+# Load server IP configuration
+declare -A server_ips
+while IFS='=' read -r key value; do
+    server_ips[$key]="$value"
+done < "$CONFIG_FILE"
+
+# Function to log to file in JSON format
+log_to_json() {
+    # Construct the JSON object
+    json_object=$(cat <<EOF
+{
+    "date": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "database_name": "$db_name",
+    "mysql_user": "$db_name",
+    "mysql_password": "$password",
+    "allowed_ips": [$allowed_ips]
+}
+EOF
+)
+    # Append the JSON object to the log file
+    echo "$json_object" >> $LOG_FILE
+}
+
+create_user() {
+    # Prompt user for the database name
+    read -r -p "Enter the database name: " db_name
+
+    # Check if the database already exists
+    if mysql -sN -e "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='$db_name';" | grep -q "$db_name"; then
+        echo "Database '$db_name' already exists."
+        exit 1
+    fi
+
+    # Generate a random password for the MySQL user
+    password=$(openssl rand -base64 12)
+
+    # MySQL commands to create database
+    mysql -e "CREATE DATABASE IF NOT EXISTS $db_name;"
+
+    # Check if the user already exists
+    user_exists=$(mysql -sse "SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '$db_name' AND host = 'localhost');")
+
+    # Create user if it doesn't exist and grant privileges
+    if [[ "$user_exists" == "0" ]]; then
+        mysql -e "CREATE USER '$db_name'@'localhost' IDENTIFIED BY '$password';"
+    fi
+
+    # Always grant privileges whether user was just created or already existed
+    mysql -e "GRANT ALL PRIVILEGES ON $db_name.* TO '$db_name'@'localhost';"
+
+    # Initialize IPs list for JSON
+    allowed_ips=""
+
+    # Function to add IP to the JSON list and grant access
+    add_ip_and_grant() {
+        local server_key="$1"
+        local ip="${server_ips[$server_key]}"
+        if [ -z "$ip" ]; then
+            echo "No IP address mapped for $server_key."
+            return
+        fi
+        mysql -e "CREATE USER '$db_name'@'$ip' IDENTIFIED BY '$password';"
+        mysql -e "GRANT ALL PRIVILEGES ON $db_name.* TO '$db_name'@'$ip';"
+        allowed_ips="$allowed_ips\"$ip\","
+    }
+
+    # Prompt user for which servers can access the database and grant access
+    for server_key in "${!server_ips[@]}"; do
+        read -r -p "Do you want to allow access from the ${server_key#allow_} server (${server_ips[$server_key]})? (y/n): " response
+        if [[ $response == "y" ]]; then
+            add_ip_and_grant $server_key
+        fi
+    done
+
+    # Apply the changes
+    mysql -e "FLUSH PRIVILEGES;"
+
+    # Remove trailing comma from allowed_ips list for JSON formatting
+    allowed_ips="[${allowed_ips%,}]"
+
+    # Print the password
+    echo "Password for MySQL user '$db_name': $password"
+    # Log to the JSON file
+    log_to_json
+}
+
+add_permission() {
+    # Ask for the MySQL username
+    read -r -p "Enter the MySQL username to modify: " username
+
+    # Initialize IPs list for JSON modification
+    modify_ips=""
+
+    # Function to modify IP permissions and update list
+    modify_ip_permissions() {
+        local server_key="$1"
+        local ip="${server_ips[$server_key]}"
+        if [ -z "$ip" ]; then
+            echo "No IP address mapped for $server_key."
+            return
+        fi
+        read -r -p "Do you want to add permissions for the $username on the ${server_key#allow_} server ($ip)? (y/n): " response
+        if [[ $response == "y" ]]; then
+            mysql -e "CREATE USER IF NOT EXISTS '$username'@'$ip' IDENTIFIED BY 'password';" # Note: Change 'password' to actual user's password or a secure method.
+            mysql -e "GRANT ALL PRIVILEGES ON *.* TO '$username'@'$ip';" # Modify this if you need more specific permissions.
+            modify_ips="$modify_ips\"$ip\","
+        fi
+    }
+
+    # Ask user for which servers to add permissions and modify permissions
+    for server_key in "${!server_ips[@]}"; do
+        modify_ip_permissions "$server_key"
+    done
+
+    # Apply the changes
+    mysql -e "FLUSH PRIVILEGES;"
+
+    # Remove trailing comma from modify_ips list for JSON formatting
+    modify_ips="[${modify_ips%,}]"
+
+    # Log the permission modification
+    local json_object=$(cat <<EOF
+{
+    "date": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "username": "$username",
+    "modified_permissions_ips": $modify_ips
+}
+EOF
+    )
+    echo "$json_object" >> $LOG_FILE
+
+    echo "Permissions updated for $username."
+}
+
+
+# Main script logic
+if [ $# -eq 0 ]; then
+    print_help
+    exit 0
+fi
+
+# Parse command-line options
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -h|--help) print_help; exit 0 ;;
+        -c|--create) create_user; exit 0 ;;
+        -l|--list) list_data; exit 0 ;;
+        -ap|--add-permission) add_permission; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; print_help; exit 1 ;;
+    esac
+done

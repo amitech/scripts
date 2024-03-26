@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# Author - Amit Sharma
+
+# Description - Backup mysql db and upload to s3
+
+import os
+import subprocess
+from datetime import datetime
+import logging
+import tarfile
+import sys
+import boto3
+from botocore.exceptions import ClientError
+import json
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+
+
+# Configure logging
+logging.basicConfig(filename='/var/log/mysqldump/mysql_backup.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Function to read configuration from JSON file
+def read_config():
+    try:
+        with open('/etc/mysql-backup/config.json') as f:
+            config = json.load(f)
+        return config
+    except Exception as e:
+        logging.error(f"Error reading config file: {e}")
+        sys.exit(f"Exiting because of error reading config file: {e}")
+
+
+# Function to dump a specific MySQL database
+def dump_database(database, mysql_config):
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    backup_dir = f'/opt/mysql-database-backup/{timestamp}'
+    os.makedirs(backup_dir, exist_ok=True)
+
+    # Add timestamp to filename
+    filename = f'{backup_dir}/{database}_{timestamp}.sql'
+    try:
+        subprocess.run(['mysqldump', '-h', mysql_config['host'], '-u', mysql_config['user'], '-p' + mysql_config['password'], database, '--single-transaction', '--routines', '--triggers',
+                       '--events', '--skip-lock-tables', '--skip-comments', '--complete-insert', '--skip-extended-insert', '--result-file=' + filename], check=True)
+        return filename
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error dumping database {database}: {e.output}")
+        return None
+
+
+# Function to create a tar.gz archive for a database backup
+def create_tar(database, sql_file):
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    tar_filename = f'/opt/mysql-database-backup/{database}_{timestamp}.tar.gz'
+    with tarfile.open(tar_filename, 'w:gz') as tar:
+        tar.add(sql_file, arcname=os.path.basename(sql_file))
+    return tar_filename
+
+
+# Function to upload a specific backup file to S3
+def upload_to_s3(filename, s3_config):
+    if filename is None:
+        return
+
+    session = boto3.Session(
+        aws_access_key_id=s3_config['access_key'],
+        aws_secret_access_key=s3_config['secret_key'],
+    )
+    try:
+        s3 = session.client('s3')
+        s3_path = f'prod-dbserver/{os.path.basename(filename)}'
+
+        s3.upload_file(filename, s3_config['bucket_name'], s3_path)
+        logging.info(f"Uploaded {s3_path} to S3.")
+    except Exception as e:
+        s3_path = f'prod-dbserver/{os.path.basename(filename)}'  # Assign s3_path before logging
+        logging.error(f"Error uploading {s3_path} to S3: {e}")
+        sys.exit(f"Exiting because of error {e}")
+
+
+# Function to delete local backup files older than a specified number of days
+def delete_local_files(days):
+    for root, dirs, files in os.walk('/opt/mysql-database-backup'):
+        for file in files:
+            file_path = os.path.join(root, file)
+            file_creation_time = datetime.fromtimestamp(
+                os.path.getctime(file_path))
+            if datetime.now() - file_creation_time > timedelta(days=days):
+                os.remove(file_path)
+                logging.info(f"Deleted local backup file: {file_path}")
+
+
+# Function to delete S3 objects older than a specified number of days
+def delete_old_s3_files(s3_config, days):
+    session = boto3.Session(
+        aws_access_key_id=s3_config['access_key'],
+        aws_secret_access_key=s3_config['secret_key'],
+    )
+    s3 = session.client('s3')
+    try:
+        response = s3.list_objects_v2(Bucket=s3_config['bucket_name'])
+        for obj in response.get('Contents', []):
+            obj_key = obj['Key']
+            obj_last_modified = obj['LastModified']
+            if datetime.now() - obj_last_modified.replace(tzinfo=None) > timedelta(days=days):
+                try:
+                    s3.delete_object(
+                        Bucket=s3_config['bucket_name'], Key=obj_key)
+                    logging.info(f"Deleted S3 object: {obj_key}")
+                except ClientError as e:
+                    logging.error(
+                        f"Failed to delete object {obj_key} from S3: {e}")
+    except Exception as e:
+        logging.error(f"Error listing S3 objects: {e}")
+        sys.exit(f"Exiting because of error {e}")
+
+
+# Function to send email notification
+def send_email(subject, body, recipients, smtp_config):
+    message = Mail(
+        from_email=smtp_config['sender_email'],
+        to_emails=recipients,
+        subject=subject,
+        plain_text_content=body)
+    try:
+        sg = SendGridAPIClient(smtp_config['password'])
+        sg.send(message)
+        logging.info("Email notification sent successfully")
+    except Exception as e:
+        logging.error(f"Failed to send email notification: {e}")
+
+
+# Main function
+def main():
+    DAYS_LOCAL_BACKUP = 3
+    DAYS_S3_BACKUP = 35
+    
+    logging.info('Starting MySQL backup process.')
+    # Read configuration from JSON file
+    config = read_config()
+    mysql_config = config['mysql']
+    s3_config = config['s3']
+    smtp_config = config['smtp']
+    recipients = config['email_recipients']
+
+    # Check if include_databases key exists in config
+    if 'include_databases' in mysql_config:
+        include_databases = mysql_config['include_databases']
+    else:
+        logging.error("Include databases list not found in config file.")
+        sys.exit("Exiting because of missing include databases list in config file.")
+
+    # Get a list of all databases
+    try:
+        databases = subprocess.check_output(['mysql', '-h', mysql_config['host'], '-u', mysql_config['user'], '-p' + mysql_config['password'], '-e', 'show databases;'], stderr=subprocess.STDOUT, universal_newlines=True).split('\n')[1:-1]
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error accessing MySQL: {e.output}")
+        return
+
+    # Dump, compress, and upload each database, including only those in the include list
+    for database in databases:
+        if database in include_databases:
+            logging.info(f"Backing up database {database}...")
+            sql_file = dump_database(database, mysql_config)
+            if sql_file:
+                tar_file = create_tar(database, sql_file)
+                upload_to_s3(tar_file, s3_config)
+                logging.info(f"Backup of database {database} complete.")
+            else:
+                logging.error(f"Backup of database {database} failed.")
+                # Send email notification if backup job fails
+                send_email("MySQL Backup Failure",
+                       f"Backup of database {database} failed.", recipients, smtp_config)
+
+    # Delete local files
+    logging.info('Starting local files cleanup process.')
+    delete_local_files(DAYS_LOCAL_BACKUP)
+    logging.info('Local files cleanup process completed.')
+
+    logging.info('Starting S3 cleanup process.')
+    # Call function to delete old S3 files
+    delete_old_s3_files(s3_config, DAYS_S3_BACKUP)
+    logging.info('S3 cleanup process completed.')
+
+    logging.info("Backup of all databases completed.")
+
+
+if __name__ == '__main__':
+    main()

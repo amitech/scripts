@@ -1,5 +1,5 @@
-# python_scripts
+# Scripts for DevOps/SRE
 
-I will add python scripts which I created during my learning and I use in my daily life.
+I will add scripts which I created during my learning and I use in my daily life.
 
-Feel free to suggest or modify. :)
+Feel free to use, modify. :)
